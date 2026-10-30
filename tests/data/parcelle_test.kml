@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+
+    <name>Parcelle Test SmartSahaBio</name>
+
+    <Placemark>
+      <name>Parcelle Test</name>
+
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>
+              47.2231,-21.4502,0
+              47.2260,-21.4502,0
+              47.2260,-21.4515,0
+              47.2231,-21.4515,0
+              47.2231,-21.4502,0
+            </coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+
+    </Placemark>
+
+  </Document>
+</kml>

@@ -1,0 +1,23 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "nom": "Parcelle Test"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [47.2231, -21.4502],
+            [47.2260, -21.4502],
+            [47.2260, -21.4515],
+            [47.2231, -21.4515],
+            [47.2231, -21.4502]
+          ]
+        ]
+      }
+    }
+  ]
+}

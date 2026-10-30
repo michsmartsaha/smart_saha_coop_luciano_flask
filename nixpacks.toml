@@ -1,0 +1,9 @@
+# Nixpacks configuration for Railway native deployment (No Docker)
+[phases.setup]
+nixPkgs = ["python311", "gdal", "geos", "proj"]
+
+[phases.install]
+cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+
+[start]
+cmd = "gunicorn run:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120"
