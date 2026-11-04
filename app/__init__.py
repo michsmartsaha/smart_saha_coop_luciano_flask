@@ -30,6 +30,8 @@ def create_app():
         "http://localhost:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5173",
+        "https://smartsahabio.vercel.app",
+        "https://smart-saha-coop-luciano-front.vercel.app",
     ]
     frontend_url = os.getenv("FRONTEND_URL")
     if frontend_url:
