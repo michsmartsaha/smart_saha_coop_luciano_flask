@@ -1638,3 +1638,21 @@ ALTER TABLE public.farmers ADD COLUMN IF NOT EXISTS phone text;
 ALTER TABLE public.fire_alerts DROP CONSTRAINT IF EXISTS fire_alerts_alert_type_check;
 ALTER TABLE public.fire_alerts ADD CONSTRAINT fire_alerts_alert_type_check CHECK (alert_type IN ('email', 'notification', 'sms'));
 
+-- Fonction sécurisée pour vérifier si un utilisateur existe par e-mail
+CREATE OR REPLACE FUNCTION public.check_user_exists_by_email(user_email text)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, auth
+AS $$
+BEGIN
+  RETURN EXISTS (
+    SELECT 1 
+    FROM auth.users 
+    WHERE lower(email) = lower(trim(user_email))
+  );
+END;
+$$;
+
+-- Autoriser l'appel depuis l'API backend
+GRANT EXECUTE ON FUNCTION public.check_user_exists_by_email(text) TO anon, authenticated, service_role;

@@ -1,10 +1,15 @@
+import os
 from flask import Blueprint, current_app, request, jsonify
 
 from app.services.auth_service import (
     register_user,
     login_user,
     get_user,
-    logout_user
+    logout_user,
+    request_password_reset,
+    update_password,
+    verify_email_otp,
+    resend_signup_otp
 )
 from app.utils.auth import get_current_user_and_role
 
@@ -66,7 +71,8 @@ def register():
                 print("⚠️ Upsert user_profiles lors du register :", pe)
 
         return jsonify({
-            "message": "Compte gestionnaire de coopérative créé avec succès",
+            "message": "Compte gestionnaire de coopérative créé avec succès. Un code de validation à 6 chiffres vous a été envoyé par e-mail.",
+            "requires_verification": True,
             "user": user_data
         }), 201
 
@@ -256,6 +262,7 @@ def update_profile():
     first_name = (data.get("first_name") or "").strip()
     last_name = (data.get("last_name") or "").strip()
     phone = (data.get("phone") or "").strip() if data.get("phone") else None
+    current_password = (data.get("current_password") or "").strip() if data.get("current_password") else None
     new_password = (data.get("password") or "").strip() if data.get("password") else None
 
     if not first_name or not last_name:
@@ -263,10 +270,19 @@ def update_profile():
             "error": "Le prénom et le nom sont obligatoires"
         }), 400
 
-    if new_password and len(new_password) < 6:
-        return jsonify({
-            "error": "Le nouveau mot de passe doit comporter au moins 6 caractères"
-        }), 400
+    if new_password:
+        if not current_password:
+            return jsonify({
+                "error": "Le mot de passe actuel est obligatoire pour modifier votre mot de passe"
+            }), 400
+        if len(new_password) < 6:
+            return jsonify({
+                "error": "Le nouveau mot de passe doit comporter au moins 6 caractères"
+            }), 400
+        if current_password == new_password:
+            return jsonify({
+                "error": "Le nouveau mot de passe doit être différent de votre mot de passe actuel"
+            }), 400
 
     try:
         from datetime import datetime, timezone
@@ -281,6 +297,20 @@ def update_profile():
             }), 401
 
         user_id = user_res.user.id
+        user_email = user_res.user.email
+
+        if new_password:
+            # Vérification du mot de passe actuel
+            try:
+                current_app.supabase.auth.sign_in_with_password({
+                    "email": user_email,
+                    "password": current_password
+                })
+            except Exception as auth_err:
+                current_app.logger.warning("Échec validation mot de passe actuel : %s", auth_err)
+                return jsonify({
+                    "error": "Le mot de passe actuel est incorrect"
+                }), 400
 
         # 1. Mise à jour de public.user_profiles
         update_data = {
@@ -304,13 +334,40 @@ def update_profile():
             auth_update["password"] = new_password
 
         try:
-            current_app.supabase.auth.update_user(auth_update)
+            if new_password:
+                try:
+                    current_app.supabase.auth.admin.update_user_by_id(user_id, auth_update)
+                except Exception as adm_e:
+                    current_app.logger.warning("auth.admin.update_user_by_id fallback : %s", adm_e)
+                    current_app.supabase.auth.update_user(auth_update)
+            else:
+                current_app.supabase.auth.update_user(auth_update)
         except Exception as e:
             print("⚠️ Auth update_user info :", e)
 
-        # Récupération de l'utilisateur rafraîchi
-        refreshed = get_user(current_app.supabase, access_token)
-        user_dict = refreshed.user.model_dump() if refreshed.user else {}
+        # Si le mot de passe a été modifié, reconnecter immédiatement pour renouveler le JWT
+        new_access_token = None
+        new_refresh_token = None
+        if new_password:
+            try:
+                new_session_res = current_app.supabase.auth.sign_in_with_password({
+                    "email": user_email,
+                    "password": new_password
+                })
+                if new_session_res and new_session_res.session:
+                    new_access_token = new_session_res.session.access_token
+                    new_refresh_token = new_session_res.session.refresh_token
+            except Exception as relogin_e:
+                current_app.logger.warning("Auto sign-in après mise à jour mot de passe : %s", relogin_e)
+
+        # Récupération sécurisée du profil utilisateur sans dépendre de l'ancien token révoqué
+        try:
+            admin_user_res = current_app.supabase.auth.admin.get_user_by_id(user_id)
+            refreshed_user = getattr(admin_user_res, "user", admin_user_res)
+            user_dict = refreshed_user.model_dump() if hasattr(refreshed_user, "model_dump") else {}
+        except Exception:
+            user_dict = user_res.user.model_dump() if hasattr(user_res.user, "model_dump") else {}
+
         user_dict["first_name"] = first_name
         user_dict["last_name"] = last_name
         user_dict["phone"] = phone
@@ -319,11 +376,16 @@ def update_profile():
             or "cooperative_manager"
         )
 
-        return jsonify({
+        response_payload = {
             "success": True,
             "message": "Profil mis à jour avec succès",
             "user": user_dict
-        }), 200
+        }
+        if new_access_token:
+            response_payload["access_token"] = new_access_token
+            response_payload["refresh_token"] = new_refresh_token
+
+        return jsonify(response_payload), 200
 
     except Exception as e:
         current_app.logger.error("Erreur mise à jour profil : %s", str(e))
@@ -371,3 +433,221 @@ def logout():
         return jsonify({
             "error": "Erreur lors de la déconnexion"
         }), 401
+
+
+def translate_auth_error(err_str: str) -> str:
+    lower = (err_str or "").lower()
+    if "error sending recovery email" in lower:
+        return "Impossible d'expédier l'e-mail de réinitialisation. Veuillez vérifier la configuration de la messagerie."
+    if "rate limit" in lower or "too many requests" in lower:
+        return "Trop de demandes en peu de temps. Veuillez patienter quelques minutes avant de réessayer."
+    if "token has expired" in lower or "token is expired" in lower:
+        return "Le code de confirmation a expiré. Veuillez demander un nouveau code."
+    if "token is invalid" in lower or "invalid token" in lower:
+        return "Le code de confirmation saisi est incorrect. Veuillez vérifier les 6 chiffres."
+    if "already confirmed" in lower:
+        return "Cette adresse email a déjà été confirmée. Vous pouvez vous connecter directement."
+    if "expired" in lower or "otp_expired" in lower:
+        return "Ce lien ou code de validation a expiré. Veuillez refaire une demande."
+    if "invalid" in lower:
+        return "Le lien ou code de validation est invalide. Veuillez vérifier votre saisie."
+    if "password" in lower and ("short" in lower or "least" in lower or "character" in lower):
+        return "Le mot de passe doit comporter au moins 6 caractères."
+    if "user not found" in lower:
+        return "Aucun compte associé à cette adresse e-mail."
+    if "network" in lower or "connect" in lower or "timeout" in lower:
+        return "Impossible de joindre le serveur d'authentification. Veuillez réessayer."
+    return err_str
+
+
+@auth_bp.post("/forgot-password")
+def forgot_password():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        return jsonify({
+            "error": "L'adresse e-mail est obligatoire"
+        }), 400
+
+    # 1. Vérification préalable : existence d'un compte lié à cette adresse e-mail
+    try:
+        rpc_res = current_app.supabase.rpc(
+            "check_user_exists_by_email",
+            {"user_email": email}
+        ).execute()
+
+        if rpc_res and rpc_res.data is False:
+            return jsonify({
+                "error": "Aucun compte n'est associé à cette adresse e-mail."
+            }), 404
+    except Exception as check_err:
+        current_app.logger.warning("Vérification RPC existence utilisateur : %s", check_err)
+
+    # 2. Détection de l'URL de redirection vers le frontend
+    frontend_origin = os.getenv("FRONTEND_URL")
+    if frontend_origin:
+        frontend_origin = frontend_origin.split(",")[0].strip().rstrip("/")
+    elif request.headers.get("Origin"):
+        frontend_origin = request.headers.get("Origin").rstrip("/")
+    else:
+        frontend_origin = "http://localhost:5173"
+
+    redirect_to = f"{frontend_origin}/reset-password"
+
+    # 3. Envoi de l'e-mail de réinitialisation
+    try:
+        request_password_reset(
+            current_app.supabase,
+            email=email,
+            redirect_to=redirect_to
+        )
+        return jsonify({
+            "success": True,
+            "message": "Un lien sécurisé de réinitialisation vous a été envoyé par email."
+        }), 200
+    except Exception as e:
+        error_msg = str(e)
+        current_app.logger.error("Erreur forgot_password : %s", error_msg)
+        print("🚨 ERREUR FORGOT_PASSWORD :", repr(e))
+
+        return jsonify({
+            "error": translate_auth_error(error_msg)
+        }), 400
+
+
+@auth_bp.post("/reset-password")
+def reset_password():
+    data = request.get_json(silent=True) or {}
+    new_password = (data.get("password") or "").strip()
+    access_token = (data.get("access_token") or "").strip()
+    auth_code = (data.get("code") or "").strip()
+
+    # Si access_token n'est pas dans le corps, vérifier le header Authorization
+    if not access_token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            access_token = auth_header.split(" ", 1)[1].strip()
+
+    if not new_password:
+        return jsonify({
+            "error": "Le nouveau mot de passe est obligatoire"
+        }), 400
+
+    if len(new_password) < 6:
+        return jsonify({
+            "error": "Le mot de passe doit comporter au moins 6 caractères"
+        }), 400
+
+    if not access_token and not auth_code:
+        return jsonify({
+            "error": "Jeton ou code de réinitialisation manquant ou invalide"
+        }), 400
+
+    try:
+        update_password(
+            current_app.supabase,
+            new_password=new_password,
+            access_token=access_token if access_token else None,
+            auth_code=auth_code if auth_code else None
+        )
+        return jsonify({
+            "success": True,
+            "message": "Votre mot de passe a été réinitialisé avec succès. Vous pouvez maintenant vous connecter."
+        }), 200
+    except Exception as e:
+        err_str = str(e)
+        current_app.logger.error("Erreur reset_password : %s", err_str)
+
+        return jsonify({
+            "error": translate_auth_error(err_str)
+        }), 400
+
+
+@auth_bp.post("/verify-email")
+def verify_email():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    token = (data.get("token") or "").strip()
+
+    if not email:
+        return jsonify({
+            "error": "L'adresse e-mail est obligatoire"
+        }), 400
+
+    if not token or len(token) < 6:
+        return jsonify({
+            "error": "Veuillez saisir un code de vérification valide"
+        }), 400
+
+    try:
+        response = verify_email_otp(current_app.supabase, email, token)
+
+        if not response or not response.user:
+            return jsonify({
+                "error": "Code de confirmation invalide ou expiré."
+            }), 400
+
+        user_id = response.user.id
+        user_meta = response.user.user_metadata or {}
+        user_role = user_meta.get("role", "cooperative_manager")
+
+        # Récupération du rôle dans user_profiles
+        if user_id:
+            try:
+                prof_res = current_app.supabase.table("user_profiles").select("*").eq("id", user_id).execute()
+                if prof_res.data and len(prof_res.data) > 0:
+                    user_role = prof_res.data[0].get("role") or user_role
+            except Exception as pe:
+                print("⚠️ Erreur vérification rôle après verify-email :", pe)
+
+        user_dict = response.user.model_dump() if hasattr(response.user, "model_dump") else (response.user if isinstance(response.user, dict) else {})
+        user_dict["role"] = user_role
+
+        session_access_token = None
+        session_refresh_token = None
+        if response.session:
+            session_access_token = response.session.access_token
+            session_refresh_token = response.session.refresh_token
+
+        return jsonify({
+            "success": True,
+            "message": "Votre adresse email a été confirmée avec succès !",
+            "access_token": session_access_token,
+            "refresh_token": session_refresh_token,
+            "user": user_dict
+        }), 200
+
+    except Exception as e:
+        err_str = str(e)
+        current_app.logger.error("Erreur verify_email : %s", err_str)
+        print("🚨 ERREUR VERIFY_EMAIL :", repr(e))
+        return jsonify({
+            "error": translate_auth_error(err_str)
+        }), 400
+
+
+@auth_bp.post("/resend-verification-code")
+def resend_verification_code():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        return jsonify({
+            "error": "L'adresse e-mail est obligatoire"
+        }), 400
+
+    try:
+        resend_signup_otp(current_app.supabase, email)
+        return jsonify({
+            "success": True,
+            "message": "Un nouveau code de confirmation a été envoyé à votre adresse e-mail."
+        }), 200
+    except Exception as e:
+        err_str = str(e)
+        current_app.logger.error("Erreur resend_verification_code : %s", err_str)
+        print("🚨 ERREUR RESEND_OTP :", repr(e))
+        return jsonify({
+            "error": translate_auth_error(err_str)
+        }), 400
+
